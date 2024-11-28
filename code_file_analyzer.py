@@ -4,6 +4,7 @@ import pandas as pd
 import ast
 from croniter import croniter
 from pathlib import Path
+import sqlparse
 
 FILE_TYPES = {
     ".sh": "Shell Script",
@@ -11,10 +12,26 @@ FILE_TYPES = {
     ".sql": "SQL Script",
 }
 
+# List of SQL keywords to detect
+SQL_KEYWORDS = r"(SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|MERGE|TRUNCATE|REPLACE|WITH|DESCRIBE)"
+
 
 def count_lines(file_path):
     """Count the number of lines in a file."""
     return sum(1 for _ in open(file_path, encoding="utf-8", errors="ignore"))
+
+
+def extract_sql_queries(content):
+    """Extract and validate SQL queries using sqlparse."""
+    sql_queries = []
+    potential_queries = re.findall(r"['\"](.*?['\"])", content, re.DOTALL)
+
+    for query in potential_queries:
+        if re.search(SQL_KEYWORDS, query, re.IGNORECASE):
+            parsed = sqlparse.parse(query)
+            if parsed:
+                sql_queries.append(query.strip())
+    return sql_queries
 
 
 def extract_cron_triggers(file_path):
@@ -52,17 +69,29 @@ def analyze_pyspark(file_path):
     sources, sinks, dependencies = [], [], []
     variables = {}
     query_count = 0  # To count the number of SQL queries executed
-
     with open(file_path, encoding="utf-8", errors="ignore") as f:
         lines = f.readlines()
-
+        content = f.read()
         # Updated regex to handle multi-line SQL queries within spark.sql()
         sql_query_pattern = re.compile(
             r'\s*spark\.sql\([\'"](.*?)[\'"]\)', re.DOTALL
         )  # Matches across lines
 
         sql_queries = []  # To store the matched queries
+        # Detect SQL strings by using sqlparse to validate and extract queries
+        string_pattern = (
+            r"[\"']([^\"']*?[SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER].*?)[\"']"
+        )
+        potential_queries = re.findall(string_pattern, content, re.IGNORECASE)
 
+        for query in potential_queries:
+            parsed = sqlparse.parse(query)
+            if parsed:
+                sql_queries.append(query.strip())
+                query_count += 1
+        print(
+            f"------------------------------------------PYSPARK----query_count {query_count}"
+        )
         # Iterate through each line to detect sources, sinks, and SQL queries
         for line in lines:
             # Detect dependencies: look for PySpark imports
@@ -134,14 +163,16 @@ def analyze_pyspark(file_path):
                     print(f"Sink found: Parquet File {file_path} (mode: {save_mode})")
 
             # Detect SQL queries via `spark.sql("<SQL_QUERY>")`
-            sql_query_match = sql_query_pattern.search(
-                line
-            )  # Use search instead of match
+            sql_query_match = sql_query_pattern.search(line)
             if sql_query_match:
-                query_count += 1  # Increment query count
                 sql_query = sql_query_match.group(1).strip()
-                sql_queries.append(sql_query)  # Store the SQL query for later debugging
-                print(f"SQL query detected: {sql_query}")
+                # Check if the query contains any SQL keywords
+                if re.search(SQL_KEYWORDS, sql_query, re.IGNORECASE):
+                    query_count += 1  # Increment query count
+                    sql_queries.append(
+                        sql_query
+                    )  # Store the SQL query for later debugging
+                    print(f"SQL query detected: {sql_query}")
 
     # Final debugging outputs
     print("Final sources found:", sources)
@@ -150,7 +181,7 @@ def analyze_pyspark(file_path):
     print(f"Total SQL queries detected: {query_count}")
     print(f"SQL Queries detected: {sql_queries}")
 
-    return sources, sinks, dependencies
+    return sources, sinks, dependencies, query_count
 
 
 # Helper function to extract import statements
@@ -231,21 +262,35 @@ def extract_imports_and_counts(file_path):
     return imports, class_count, function_count
 
 
+# def analyze_sql(file_path):
+#     """Analyze SQL scripts for tables and data sources."""
+#     sources, sinks = [], []
+#     with open(file_path, encoding="utf-8", errors="ignore") as f:
+#         content = f.read()
+#         table_matches = re.findall(r"(FROM|INTO)\s+([`'\"].+?[`'\"].+?)\s*", content)
+#         for match in table_matches:
+#             action, table = match
+#             if action.upper() == "FROM":
+#                 sources.append(table)
+#                 print(f"Detected source table: {table}")
+#             elif action.upper() == "INTO":
+#                 sinks.append(table)
+#                 print(f"Detected sink table: {table}")
+#     return sources, sinks
+
+
 def analyze_sql(file_path):
-    """Analyze SQL scripts for tables and data sources."""
-    sources, sinks = [], []
+    """Analyze SQL scripts for tables and query counts."""
+    tables = []
+    query_count = 0
     with open(file_path, encoding="utf-8", errors="ignore") as f:
         content = f.read()
-        table_matches = re.findall(r"(FROM|INTO)\s+([`'\"].+?[`'\"].+?)\s*", content)
-        for match in table_matches:
-            action, table = match
-            if action.upper() == "FROM":
-                sources.append(table)
-                print(f"Detected source table: {table}")
-            elif action.upper() == "INTO":
-                sinks.append(table)
-                print(f"Detected sink table: {table}")
-    return sources, sinks
+        matches = re.findall(r"FROM\s+(\w+)|JOIN\s+(\w+)", content, re.IGNORECASE)
+        tables = [tbl for pair in matches for tbl in pair if tbl]
+        query_count = len(
+            re.findall(r"\b(SELECT|INSERT|UPDATE|DELETE)\b", content, re.IGNORECASE)
+        )
+    return tables, query_count
 
 
 def analyze_file(file_path, repo_name):
@@ -266,17 +311,17 @@ def analyze_file(file_path, repo_name):
         "triggers": [],
         "sources": [],  # Initialize sources as an empty list
         "sinks": [],  # Initialize sinks as an empty list
-        "variables": {},
-        "variable_counts": {},
+        # "variables": {},
+        # "variable_counts": {},
         "imports": [],
         "function_names": [],
         "class_names": [],
     }
 
     # Extract variables and counts
-    variables, variable_counts = extract_variables(file_path)
-    file_info["variables"] = variables
-    file_info["variable_counts"] = variable_counts
+    # variables, variable_counts = extract_variables(file_path)
+    # file_info["variables"] = variables
+    # file_info["variable_counts"] = variable_counts
 
     if file_type == "Shell Script":
         file_info["triggers"] = extract_cron_triggers(file_path)
@@ -291,15 +336,19 @@ def analyze_file(file_path, repo_name):
         class_names, function_names = extract_function_and_class_names(file_path)
         file_info["function_names"] = function_names
         file_info["class_names"] = class_names
-
+        with open(file_path, encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+            sql_queries = extract_sql_queries(content)
+            file_info["query_count"] = len(sql_queries)
         if "pyspark" in " ".join(imports):
             file_info["purpose"] = "PySpark Job"
-            sources, sinks, dependencies = analyze_pyspark(
+            sources, sinks, dependencies, query_count = analyze_pyspark(
                 file_path
             )  # Extract sources and sinks
             file_info["sources"] = sources  # Assign sources
             file_info["sinks"] = sinks  # Assign sinks
             file_info["dependencies"] = dependencies
+            file_info["query_count"] = len(sql_queries)
 
     elif file_type == "SQL Script":
         file_info["purpose"] = "SQL Query"
@@ -319,13 +368,13 @@ def analyze_repo(repo_path, output_csv, repo_name):
             file_path = os.path.join(root, file)
             if Path(file_path).suffix in FILE_TYPES:
                 file_info = analyze_file(file_path, repo_name)
-                # Serialize variables and counts for CSV
-                file_info["variables"] = ", ".join(
-                    file_info["variables"].keys()
-                )  # List of variable names
-                file_info["variable_counts"] = len(
-                    file_info["variable_counts"]
-                )  # Total number of variables
+                # # Serialize variables and counts for CSV
+                # file_info["variables"] = ", ".join(
+                #     file_info["variables"].keys()
+                # )  # List of variable names
+                # file_info["variable_counts"] = len(
+                #     file_info["variable_counts"]
+                # )  # Total number of variables
 
                 results.append(file_info)
 
@@ -339,5 +388,5 @@ def analyze_repo(repo_path, output_csv, repo_name):
 if __name__ == "__main__":
     repo_path = input("Enter the path to the code repository: ").strip()
     repo_name = Path(repo_path).name
-    output_csv = "repo_analysis_detailed_with_sources_2.csv"
+    output_csv = "repo_analysis.csv"
     analyze_repo(repo_path, output_csv, repo_name)
