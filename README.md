@@ -1,6 +1,12 @@
 # code_file_analyzer
 code_file_analyzer
 
+```
+pip install pandas
+pip install sqlparse
+pip install croniter
+```
+
 Run 
 ```
 python code_file_analyzer.py
